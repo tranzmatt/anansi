@@ -21,8 +21,8 @@ env/
 .coverage
 htmlcov/
 
-# Arachne runtime data
-~/.arachne/
+# Anansi runtime data
+~/.anansi/
 
 # Editors
 .DS_Store
