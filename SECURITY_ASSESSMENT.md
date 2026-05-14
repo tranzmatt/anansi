@@ -41,7 +41,7 @@ The audit found **3 High**, **6 Medium**, **4 Low**, and **5 Informational** iss
 
 - Denial-of-service against scraped sites, anti-bot ethics, captcha-solving legality.
 - Network-level concerns (TLS pinning, DNS rebinding mitigations beyond the SSRF check).
-- Hardening of optional dependencies (`curl-cffi`) beyond what they expose to arachne.
+- Hardening of optional dependencies (`curl-cffi`) beyond what they expose to anansi.
 - Anything that requires shell access to the operator's machine before the attack begins.
 
 ## 3. Findings
@@ -118,7 +118,7 @@ The audit found **3 High**, **6 Medium**, **4 Low**, and **5 Informational** iss
 **Status:** Fixed. `redact_userinfo()` rewrites `scheme://user:pass@host` to `scheme://***@host` (`anansi/security.py:87-99`) and is applied at every proxy-URL log site and in MCP error responses (`proxy/manager.py:158, 185, 217`; `server.py:423, 494, 556, 734`).
 - **Severity:** Medium
 - **CWE:** CWE-532 (Insertion of Sensitive Information into Log File)
-- **Location:** `arachne/proxy/manager.py:155`, `:214`
+- **Location:** `anansi/proxy/manager.py:155`, `:214`
 - **Description:** Proxy entries are stored verbatim, including any `user:pass@` portion (`manager.py:79-81`). When the health check quarantines a proxy the full URL is logged at WARNING (`"Proxy quarantined: %s"`, `manager.py:155`) and at INFO when it recovers (`:214`). Operators frequently ship logs to centralized systems (Datadog, Splunk, CloudWatch), where the credentials become broadly readable.
 - **Recommendation:** Add a `_redact_userinfo(url)` helper that rewrites `scheme://user:pass@host:port/...` to `scheme://***@host:port/...` and use it at every logger call site. Apply the same redaction to any exception messages re-raised from `httpx` that may include the proxy URL.
 
@@ -142,7 +142,7 @@ The audit found **3 High**, **6 Medium**, **4 Low**, and **5 Informational** iss
 **Status:** Fixed (documentary). `crawl_db()` carries an in-code SECURITY warning stating that untrusted `path` values must be confined via `anansi.security.confine_to_dir` before being forwarded (`anansi/db.py:108-112`). No MCP tool currently forwards a user-controlled `path` to `crawl_db()`.
 - **Severity:** Low (no MCP tool exposes this directly)
 - **CWE:** CWE-22
-- **Location:** `arachne/db.py:108-114`
+- **Location:** `anansi/db.py:108-114`
 - **Description:** `crawl_db()` accepts an arbitrary `path: Path | str | None`. If a future MCP tool ever forwards a user-supplied path to this function, the operator's filesystem is reachable. Today this is a library-level concern rather than an MCP exposure.
 - **Recommendation:** Validate that the resolved path lives under `DATA_DIR` (or an explicitly-configured root). Cheap to add, removes a latent footgun.
 
@@ -172,7 +172,7 @@ The audit found **3 High**, **6 Medium**, **4 Low**, and **5 Informational** iss
 - **Note:** Intentionally avoids `xml.etree`/`lxml.etree`, which dodges XXE / billion-laughs entirely. Trade-off: CDATA-wrapped or entity-encoded URLs are silently ignored. This is a deliberate, defensible choice; leaving as-is.
 
 ### INFO-5 — Health-check side channel via `httpbin.org`
-- **Location:** `arachne/proxy/manager.py:22`.
+- **Location:** `anansi/proxy/manager.py:22`.
 - **Note:** The default health-check URL is `https://httpbin.org/ip`. A determined attacker controlling httpbin.org (or doing DNS interception on the operator's network) can correlate proxy fingerprints and timing. Already overridable via the `health_check_url` constructor kwarg. Cosmetic; consider documenting.
 
 ## 4. What was checked and is OK
@@ -182,13 +182,13 @@ These categories were specifically searched for and found clean:
 - **Code execution sinks:** no `eval(`, `exec(`, `pickle.load`, `marshal.load`, `compile(... 'exec')` in the codebase.
 - **YAML:** project does not depend on `pyyaml`; no `yaml.load` calls.
 - **Subprocess / shell:** no `subprocess` with `shell=True`, no `os.system`, no `os.popen`.
-- **SQL injection:** all queries in `anansi/spider/queue.py` and `arachne/db.py` use `?`-parameterized statements with tuples. No string-built queries observed. Schema is hardcoded.
-- **XML/XXE:** `arachne/core.py:49` and `arachne/parser/adaptive.py:170` use `lxml.etree.fromstring(html, lxml.etree.HTMLParser())` — HTML parser mode, not XML, so external entities and DTDs are not processed. `sitemap.py` is regex-based (see INFO-4).
+- **SQL injection:** all queries in `anansi/spider/queue.py` and `anansi/db.py` use `?`-parameterized statements with tuples. No string-built queries observed. Schema is hardcoded.
+- **XML/XXE:** `anansi/core.py:49` and `anansi/parser/adaptive.py:170` use `lxml.etree.fromstring(html, lxml.etree.HTMLParser())` — HTML parser mode, not XML, so external entities and DTDs are not processed. `sitemap.py` is regex-based (see INFO-4).
 - **TLS on the HTTP path:** `httpx.AsyncClient(...)` in `anansi/fetchers/http.py:108-115` does not pass `verify=False`; defaults to certificate verification. `curl-cffi` path (`:178-189`) likewise does not disable verification.
 - **Hardcoded secrets:** no API keys, bearer tokens, or passwords committed. `auth_headers`/`cookies` are caller-supplied function parameters only.
 - **`.gitignore` hygiene:** standard Python ignores, `~/.anansi/` excluded, no `.env` overrides. Nothing sensitive is checked in.
 - **Temp files:** no `tempfile.mktemp()` (the insecure form). Filesystem writes are via `pathlib.Path` with `parents=True, exist_ok=True`.
-- **DB file permissions:** SQLite files created in `Path.home() / ".arachne"`, inheriting the user's umask. Fine for single-user installs; multi-user installs should review.
+- **DB file permissions:** SQLite files created in `Path.home() / ".anansi"`, inheriting the user's umask. Fine for single-user installs; multi-user installs should review.
 
 ## 5. Dependency notes
 
