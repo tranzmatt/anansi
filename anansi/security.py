@@ -8,10 +8,30 @@ from __future__ import annotations
 
 import gzip
 import ipaddress
+import os
 import re
 import socket
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
+
+# ── Operator-only environment switches ────────────────────────────────────────
+#
+# These are read once, at import, from the process environment. They are
+# deliberately NOT per-call arguments: an untrusted MCP/LLM client must not be
+# able to flip them. Only the operator who launches the process can.
+
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# When True the SSRF guard skips the private/loopback/metadata range check.
+# Off by default so a confused or hostile LLM cannot reach internal services.
+ALLOW_PRIVATE_NETWORKS: bool = _env_bool("ANANSI_ALLOW_PRIVATE_NETWORKS")
+
+# When True all anti-bot evasion behaviour is disabled (stealth-JS injection,
+# Cloudflare-challenge waiting, curl-cffi TLS impersonation).
+DISABLE_ANTIBOT: bool = _env_bool("ANANSI_DISABLE_ANTIBOT")
 
 # ── SSRF guard ────────────────────────────────────────────────────────────────
 

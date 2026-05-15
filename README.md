@@ -18,7 +18,7 @@ The result: a crawler that handles hostile sites, survives redesigns, and gets b
 |---|---|
 | **Self-healing parser** | CSS selectors are stored with confidence scores. When one breaks, four healing strategies run — fuzzy class matching, text-pattern regex, structural context, XPath fallback — and the winner is persisted for next time. |
 | **Structured data extraction** | JSON-LD, Open Graph, and Microdata are extracted from every page automatically. Fields matched in schema.org markup skip CSS evaluation entirely — they're more stable and require no selector maintenance. |
-| **TLS fingerprint mimicry** | Enterprise bot-detection (Cloudflare, Akamai, DataDome) fingerprints your TLS ClientHello before inspecting a single header. With `impersonate="chrome124"`, Anansi uses curl-cffi to produce a byte-for-byte copy of Chrome's TLS handshake. Install with `pip install "anansi[tls]"`. |
+| **TLS fingerprint mimicry** | Enterprise bot-detection (Cloudflare, Akamai, DataDome) fingerprints your TLS ClientHello before inspecting a single header. With `impersonate="chrome124"`, Anansi uses curl-cffi to produce a byte-for-byte copy of Chrome's TLS handshake. Install the `tls` extra (see [Install](#install)). |
 | **Auto browser upgrade** | Every HTTP response is checked for SPA markers, noscript redirects, and suspiciously low text density. JS shells trigger a silent retry with a stealth Playwright browser. The decision is cached per domain for the crawl session. |
 | **Anti-bot & Cloudflare bypass** | The browser fetcher removes `webdriver` fingerprints, spoofs plugins and hardware concurrency, adds canvas/WebGL noise, and waits out Cloudflare Turnstile challenges automatically. |
 | **Adaptive rate limiting** | A per-domain sliding window tracks error rates. A 429 immediately doubles the request gap and activates a circuit breaker. Sustained 5xx errors increase the gap further. Clean windows slowly decay back toward the base delay. |
@@ -35,15 +35,26 @@ Also includes: JS interaction (click, fill, scroll, wait), robots.txt compliance
 
 ## Install
 
+The distribution name is `anansi-scraper`; the import package is `anansi`. It
+is installed from this Git repository (not yet published to PyPI), so the
+optional extras use pip's `extras @ git+URL` syntax:
+
 ```bash
-pip install git+https://github.com/mdowis/anansi
+# Core install
+pip install "git+https://github.com/mdowis/anansi"
 
 # For browser-based fetching (Cloudflare bypass, JS rendering):
 playwright install chromium
 
-# For TLS fingerprint mimicry (curl-cffi impersonation):
-pip install "anansi-scraper[tls]"
+# With the TLS-fingerprint-mimicry extra (curl-cffi impersonation):
+pip install "anansi-scraper[tls] @ git+https://github.com/mdowis/anansi"
+
+# With the OpenAI / ChatGPT Agents SDK extra:
+pip install "anansi-scraper[openai] @ git+https://github.com/mdowis/anansi"
 ```
+
+Once installed, the MCP server is available as the `anansi-mcp` console script
+or via `python -m anansi.mcp_server.server`, and the CLI as `anansi`.
 
 **Windows:** `pip` is often not on PATH. Use `py -m pip install ...` instead. If `py` isn't found either, download Python from [python.org](https://python.org) and check **"Add Python to PATH"** during setup.
 
@@ -214,7 +225,7 @@ await Crawler.export_items(crawler.crawl_id, fmt="csv", path="/tmp/products.csv"
 ```python
 from anansi.fetchers.http import HTTPFetcher
 
-# Requires: pip install "anansi-scraper[tls]"
+# Requires the tls extra: pip install "anansi-scraper[tls] @ git+https://github.com/mdowis/anansi"
 async with HTTPFetcher(impersonate="chrome124") as f:
     result = await f.fetch("https://bot-protected-site.com")
     print(result.html)
@@ -399,7 +410,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 
 **ChatGPT / OpenAI Agents SDK (programmatic):**
 ```bash
-pip install "anansi-scraper[openai]"
+pip install "anansi-scraper[openai] @ git+https://github.com/mdowis/anansi"
 ```
 ```python
 from agents import Agent, Runner
@@ -460,6 +471,35 @@ anansi/
 
 ---
 
+## Legal / Acceptable Use
+
+Anansi is a powerful scraping tool. **You are solely responsible for how you use it.**
+Before scraping any site, ensure you have the right to access and use the data and
+that you comply with the site's Terms of Service, its `robots.txt`, applicable rate
+limits, and all relevant laws (including computer-misuse statutes such as the CFAA,
+data-protection law such as GDPR/CCPA, and copyright/database rights).
+
+The anti-bot, TLS-fingerprint-impersonation, and Cloudflare-handling features are
+intended for **authorized** testing, research, and scraping of content you have the
+right to access — not for circumventing access controls without permission. The
+authors accept no liability for damages, account bans, legal consequences, or losses
+arising from use or misuse of this software. See [`DISCLAIMER.md`](DISCLAIMER.md) for
+the full statement.
+
+### Operator controls
+
+These environment variables are read once at process start and are **not** settable
+by an MCP/LLM client — only by whoever runs the server:
+
+| Variable | Default | Effect when set to `1`/`true` |
+|---|---|---|
+| `ANANSI_ALLOW_PRIVATE_NETWORKS` | off | Allows fetches/crawls to resolve to loopback, RFC1918, link-local, and cloud-metadata addresses. Off by default so the untrusted LLM cannot reach internal services (SSRF). Enable only on a trusted, isolated host. |
+| `ANANSI_DISABLE_ANTIBOT` | off | Disables stealth-JS injection and the Cloudflare-challenge wait in the browser fetcher, and makes the HTTP fetcher ignore `impersonate=` (warns and falls back to plain httpx). Use for a compliance-conscious deployment that must not perform anti-bot evasion. |
+
+---
+
 ## License
 
-MIT
+Licensed under the Apache License, Version 2.0 — see [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE). Use of this software is additionally subject to the
+acceptable-use terms in [`DISCLAIMER.md`](DISCLAIMER.md).

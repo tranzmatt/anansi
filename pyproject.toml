@@ -8,9 +8,9 @@ version = "0.1.0"
 description = "Anansi — adaptive web scraping framework that learns from website changes"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 keywords = ["scraping", "crawling", "web", "adaptive", "playwright", "mcp"]
-authors = [{ name = "Anansi Contributors" }]
+authors = [{ name = "Matt Dowis" }]
 
 dependencies = [
     # Upper bounds limit the blast radius of a future malicious / broken

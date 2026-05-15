@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP
 
 from anansi.db import DATA_DIR
+from anansi import security
 from anansi.security import (
     OutOfRangeError,
     PathOutsideSandboxError,
@@ -78,22 +79,25 @@ _MAX_ACTIVE_CRAWLS = 16
 _MAX_ACTION_BUDGET_MS = 60_000
 
 
-def _validate_proxy(proxy: str | None, *, allow_private: bool) -> str | None:
+def _validate_proxy(proxy: str | None) -> str | None:
     """Validate a caller-supplied proxy URL or return None.
 
     Raises ``UnsafeURLError``; callers convert that into a structured tool
     error. Returns the (unchanged) proxy URL on success so it can be passed
-    through to the fetcher.
+    through to the fetcher. The private-network range check is governed by the
+    operator-only ``ANANSI_ALLOW_PRIVATE_NETWORKS`` env var, never by the
+    untrusted MCP client.
     """
     if proxy is None:
         return None
-    validate_proxy_url(proxy, allow_private=allow_private)
+    validate_proxy_url(proxy, allow_private=security.ALLOW_PRIVATE_NETWORKS)
     return proxy
 
 
-def _validate_url(url: str, *, allow_private: bool) -> None:
-    """Reject schemes other than http(s) and (by default) non-public destinations."""
-    is_url_safe_for_public_fetch(url, allow_private=allow_private)
+def _validate_url(url: str) -> None:
+    """Reject schemes other than http(s) and (unless the operator opted in via
+    ``ANANSI_ALLOW_PRIVATE_NETWORKS``) non-public destinations."""
+    is_url_safe_for_public_fetch(url, allow_private=security.ALLOW_PRIVATE_NETWORKS)
 
 
 def _validate_actions(actions: list[dict[str, Any]] | None) -> None:
@@ -277,12 +281,11 @@ async def _fetch_one(
     chunk_size: int | None = None,
     chunk_index: int = 0,
     actions: list[dict[str, Any]] | None = None,
-    allow_private_networks: bool = False,
 ) -> dict[str, Any]:
     """Fetch one URL, apply format conversion + chunking, and cache the result."""
     global _page_cache_bytes
     try:
-        _validate_url(url, allow_private=allow_private_networks)
+        _validate_url(url)
     except UnsafeURLError as exc:
         return {"url": url, "error": f"unsafe URL: {exc}", "status": None}
     try:
@@ -378,7 +381,6 @@ async def fetch_url(
     chunk_size: int | None = None,
     chunk_index: int = 0,
     actions: list[dict[str, Any]] | None = None,
-    allow_private_networks: bool = False,
 ) -> dict[str, Any]:
     """
     Fetch a single URL and return its content.
@@ -418,7 +420,7 @@ async def fetch_url(
     if actions and len(actions) > _MAX_ACTIONS:
         return {"error": f"actions list length {len(actions)} exceeds cap {_MAX_ACTIONS}"}
     try:
-        proxy = _validate_proxy(proxy, allow_private=allow_private_networks)
+        proxy = _validate_proxy(proxy)
     except UnsafeURLError as exc:
         return {"error": f"unsafe proxy: {redact_userinfo(str(exc))}"}
     if wait_for_selector is not None:
@@ -436,7 +438,6 @@ async def fetch_url(
         chunk_size=chunk_size,
         chunk_index=chunk_index,
         actions=actions,
-        allow_private_networks=allow_private_networks,
     )
 
 
@@ -451,7 +452,6 @@ async def fetch_urls(
     format: str = "html",
     chunk_size: int | None = None,
     concurrency: int = 5,
-    allow_private_networks: bool = False,
 ) -> dict[str, Any]:
     """
     Fetch multiple URLs in one call, returning results in the same order.
@@ -488,7 +488,7 @@ async def fetch_urls(
         concurrency = clamp_int(
             concurrency, name="concurrency", minimum=1, maximum=_MAX_CONCURRENCY
         )
-        proxy = _validate_proxy(proxy, allow_private=allow_private_networks)
+        proxy = _validate_proxy(proxy)
     except (OutOfRangeError, UnsafeURLError) as exc:
         return {"error": str(exc) if isinstance(exc, OutOfRangeError)
                 else f"unsafe proxy: {redact_userinfo(str(exc))}"}
@@ -506,7 +506,6 @@ async def fetch_urls(
                     format=format,
                     chunk_size=chunk_size,
                     chunk_index=0,
-                    allow_private_networks=allow_private_networks,
                 )
             except Exception as exc:
                 return {"url": url, "error": str(exc), "status": None}
@@ -530,7 +529,6 @@ async def fetch_and_extract(
     use_browser: bool = False,
     proxy: str | None = None,
     timeout: float = 30.0,
-    allow_private_networks: bool = False,
 ) -> dict[str, Any]:
     """
     Fetch a URL and extract structured data in a single tool call.
@@ -551,7 +549,7 @@ async def fetch_and_extract(
         {url, status, elapsed, via_browser, data: {field: value, ...}}
     """
     try:
-        proxy = _validate_proxy(proxy, allow_private=allow_private_networks)
+        proxy = _validate_proxy(proxy)
     except UnsafeURLError as exc:
         return {"error": f"unsafe proxy: {redact_userinfo(str(exc))}"}
     result = await _fetch_one(
@@ -560,7 +558,6 @@ async def fetch_and_extract(
         proxy=proxy,
         timeout=timeout,
         format="html",
-        allow_private_networks=allow_private_networks,
     )
     if "error" in result:
         return result
@@ -637,7 +634,6 @@ async def crawl_site(
     allowed_domains: list[str] | None = None,
     deny_patterns: list[str] | None = None,
     max_duration_seconds: float | None = None,
-    allow_private_networks: bool = False,
     forward_credentials_cross_origin: bool = False,
 ) -> dict[str, Any]:
     """
@@ -676,8 +672,6 @@ async def crawl_site(
                        Example: [r"/admin/", r"\\.pdf$"]
         max_duration_seconds: Stop the crawl after this many seconds regardless of
                               how many pages have been visited (None = no time limit).
-        allow_private_networks: Permit crawling into RFC1918 / loopback /
-                                link-local / metadata addresses. Default False.
         forward_credentials_cross_origin: When True, *cookies* and
                                           *auth_headers* are sent to every URL,
                                           including off-domain links. Default
@@ -700,8 +694,10 @@ async def crawl_site(
                           "wait for a crawl to finish or call delete_crawl"}
 
     # Validate start_url against SSRF policy before doing anything else.
+    # Private/loopback/metadata ranges are rejected unless the operator opted
+    # in via the ANANSI_ALLOW_PRIVATE_NETWORKS env var (never the MCP client).
     try:
-        _validate_url(start_url, allow_private=allow_private_networks)
+        _validate_url(start_url)
     except UnsafeURLError as exc:
         return {"error": f"unsafe start_url: {exc}"}
 
@@ -729,7 +725,7 @@ async def crawl_site(
     if proxies:
         try:
             for p in proxies:
-                validate_proxy_url(p, allow_private=allow_private_networks)
+                validate_proxy_url(p, allow_private=security.ALLOW_PRIVATE_NETWORKS)
         except UnsafeURLError as exc:
             return {"error": f"unsafe proxy: {redact_userinfo(str(exc))}"}
 
@@ -802,7 +798,6 @@ async def crawl_site(
         cookies=cookies,
         auth_headers=auth_headers,
         credential_scope_host=scope_host,
-        allow_private_networks=allow_private_networks,
         deduplicate_content=deduplicate_content,
     )
     _active_crawlers[crawl_id] = crawler
@@ -1181,7 +1176,47 @@ async def screenshot_url(
 
     Returns:
         {url, format, width, height, data_b64} or {url, format, width, height, path}
+
+    Security: this tool enforces the same validation as fetch_url — the URL
+    and proxy are SSRF-checked (private/loopback/metadata addresses are
+    rejected unless the operator set ANANSI_ALLOW_PRIVATE_NETWORKS), the
+    selector must be plain CSS, and any output path is confined to
+    ~/.anansi/exports/.
     """
+    # SSRF guard on the navigation target (parity with fetch_url).
+    try:
+        _validate_url(url)
+    except UnsafeURLError as exc:
+        return {"url": url, "error": f"unsafe URL: {exc}", "status": None}
+
+    # SSRF guard on the proxy.
+    try:
+        proxy = _validate_proxy(proxy)
+    except UnsafeURLError as exc:
+        return {"error": f"unsafe proxy: {redact_userinfo(str(exc))}"}
+
+    # CSS-only selector (no xpath=/text= engine prefixes or >> chaining).
+    if selector is not None:
+        try:
+            validate_browser_selector(selector)
+        except ValueError as exc:
+            return {"error": f"invalid selector: {exc}"}
+
+    # Bound the navigation timeout.
+    try:
+        timeout = clamp_int(int(timeout), name="timeout", minimum=1, maximum=120)
+    except OutOfRangeError as exc:
+        return {"error": str(exc)}
+
+    # Confine the output path to the export sandbox; an attacker-controlled
+    # path must not reach Path.write_bytes() (arbitrary file write).
+    confined_path: str | None = None
+    if path:
+        try:
+            confined_path = str(confine_to_dir(path, _EXPORT_ROOT))
+        except PathOutsideSandboxError as exc:
+            return {"error": f"screenshot path rejected: {exc}"}
+
     from anansi.fetchers.browser import BrowserFetcher
     bf = BrowserFetcher()
     try:
@@ -1189,7 +1224,7 @@ async def screenshot_url(
             url,
             selector=selector,
             full_page=full_page,
-            path=path,
+            path=confined_path,
             proxy=proxy,
             timeout=timeout,
         )
@@ -1222,7 +1257,32 @@ async def train_selector(
 
     Returns:
         {url_pattern, field_name, selector, selector_type, confidence}
+
+    Security: selector_type is allowlisted; a "text" selector is compiled as a
+    regex during selector healing, so it is run through the ReDoS heuristic; a
+    "css" selector must be plain CSS (no Playwright engine prefixes); url_pattern
+    and field_name are length-bounded.
     """
+    if selector_type not in ("css", "xpath", "text"):
+        return {"error": f"selector_type {selector_type!r} not allowed; "
+                          "use 'css', 'xpath', or 'text'"}
+    # url_pattern is stored verbatim as an exact-match DB key, and field_name
+    # likewise — bound both so the untrusted client cannot write unbounded rows.
+    if len(url_pattern) > 2_000 or len(field_name) > 500:
+        return {"error": "url_pattern or field_name too long"}
+    if selector_type == "text":
+        # A text selector is re.compile()'d and matched against page content
+        # during healing — gate it with the ReDoS heuristic + length cap.
+        try:
+            validate_regex(selector)
+        except UnsafeRegexError as exc:
+            return {"error": f"unsafe text selector: {exc}"}
+    elif selector_type == "css":
+        try:
+            validate_browser_selector(selector)
+        except ValueError as exc:
+            return {"error": f"invalid selector: {exc}"}
+
     from anansi.parser.adaptive import AdaptiveParser
     parser = AdaptiveParser()
     return await parser.train(url_pattern, field_name, selector, selector_type)
