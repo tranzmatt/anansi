@@ -297,8 +297,12 @@ class BrowserFetcher(BaseFetcher):
                     ignore_https_errors=self._insecure,
                     extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
                 )
-                await ctx.add_init_script(self._make_stealth_js(hw, mem))
-                await ctx.add_init_script(_WEBRTC_BLOCK_JS)
+                # Anti-bot stealth is skipped when the operator has disabled
+                # all evasion via ANANSI_DISABLE_ANTIBOT.
+                from anansi import security
+                if not security.DISABLE_ANTIBOT:
+                    await ctx.add_init_script(self._make_stealth_js(hw, mem))
+                    await ctx.add_init_script(_WEBRTC_BLOCK_JS)
                 created_at = time.monotonic()
                 req_count = 0
 
@@ -343,6 +347,15 @@ class BrowserFetcher(BaseFetcher):
         Poll until the Cloudflare challenge clears or times out.
         Also attempts to click the Turnstile checkbox if visible.
         """
+        # When the operator disabled anti-bot evasion, do not actively wait out
+        # or click through the Cloudflare challenge — return immediately and
+        # let the caller see whatever the server returned.
+        from anansi import security
+        if security.DISABLE_ANTIBOT:
+            logger.info(
+                "ANANSI_DISABLE_ANTIBOT set — not waiting out Cloudflare challenge"
+            )
+            return
         deadline = time.monotonic() + self._cf_timeout
         while time.monotonic() < deadline:
             # Try clicking the Turnstile iframe checkbox
@@ -557,9 +570,19 @@ class BrowserFetcher(BaseFetcher):
                     "elapsed": round(time.perf_counter() - t0, 3),
                 }
                 if path:
-                    import pathlib
-                    pathlib.Path(path).write_bytes(png_bytes)
-                    result["path"] = path
+                    # Defence in depth: even when called outside the MCP tool
+                    # (which already confines the path), never let an arbitrary
+                    # path reach write_bytes(). Confine to ~/.anansi/exports/.
+                    from anansi.db import DATA_DIR
+                    from anansi.security import confine_to_dir
+                    target = confine_to_dir(path, DATA_DIR / "exports")
+                    target.write_bytes(png_bytes)
+                    try:
+                        import os
+                        os.chmod(target, 0o600)
+                    except OSError:
+                        pass
+                    result["path"] = str(target)
                 else:
                     result["data_b64"] = base64.b64encode(png_bytes).decode()
                 return result

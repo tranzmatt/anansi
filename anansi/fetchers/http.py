@@ -16,6 +16,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from anansi import security
 from anansi.fetchers.base import BaseFetcher, FetchResult
 from anansi.security import (
     UnsafeURLError,
@@ -112,7 +113,6 @@ class HTTPFetcher(BaseFetcher):
         cookies: dict[str, str] | None = None,
         impersonate: str | None = None,
         max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
-        allow_private_networks: bool = False,
     ) -> None:
         self._max_retries = max_retries
         self._timeout = timeout
@@ -125,10 +125,6 @@ class HTTPFetcher(BaseFetcher):
         self._session_cookies: dict[str, str] = {}
         self._impersonate = impersonate
         self._max_response_bytes = max_response_bytes
-        # When False, every redirect Location is run through the SSRF guard
-        # before the next hop is fetched. httpx's built-in auto-redirect is
-        # disabled in this mode so the check is not bypassed.
-        self._allow_private_networks = allow_private_networks
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -179,6 +175,20 @@ class HTTPFetcher(BaseFetcher):
         timeout: float,
     ) -> FetchResult:
         """Fetch using curl-cffi to mimic a real browser TLS fingerprint."""
+        # Operator kill-switch: when anti-bot evasion is disabled, do not
+        # perform TLS-fingerprint impersonation. Warn and fall back to plain
+        # httpx so existing callers keep working (per confirmed decision).
+        if security.DISABLE_ANTIBOT:
+            logger.warning(
+                "ANANSI_DISABLE_ANTIBOT set — ignoring impersonate=%r and "
+                "falling back to plain httpx",
+                self._impersonate,
+            )
+            self._impersonate = None
+            return await self._fetch_httpx(
+                url, method=method, headers=headers,
+                body=body, proxy=proxy, timeout=timeout,
+            )
         try:
             from curl_cffi.requests import AsyncSession
         except ImportError:
@@ -312,7 +322,7 @@ class HTTPFetcher(BaseFetcher):
                             try:
                                 is_url_safe_for_public_fetch(
                                     next_url,
-                                    allow_private=self._allow_private_networks,
+                                    allow_private=security.ALLOW_PRIVATE_NETWORKS,
                                 )
                             except UnsafeURLError:
                                 # Surface as a non-retryable failure so the

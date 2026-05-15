@@ -30,6 +30,7 @@ from anansi.core import Item, Request, Response
 from anansi.db import DATA_DIR, crawl_db
 from anansi.fetchers.base import BaseFetcher, FetchResult
 from anansi.fetchers.http import HTTPFetcher
+from anansi import security
 from anansi.security import (
     UnsafeURLError,
     escape_csv_cell,
@@ -312,7 +313,6 @@ class Crawler:
         cookies: dict[str, str] | None = None,
         auth_headers: dict[str, str] | None = None,
         credential_scope_host: str | None = None,
-        allow_private_networks: bool = False,
         deduplicate_content: bool = False,
         adaptive_rate_limiting: bool = True,
         conditional_get: bool = True,
@@ -342,12 +342,6 @@ class Crawler:
         # hosts (legacy behaviour; used by library callers who handle their
         # own scoping).
         self._credential_scope_host = credential_scope_host
-        # When False, every URL fetched (including links followed from response
-        # HTML and entries pulled from sitemaps) is re-validated against the
-        # SSRF guard. The MCP entry point already validates start_url at submit
-        # time; this catches the case where an attacker steers the crawler to
-        # private addresses via links in the start page or sitemap.
-        self._allow_private_networks = allow_private_networks
         self._deduplicate_content = deduplicate_content
         self._conditional_get = conditional_get
         self._auto_browser = auto_browser
@@ -573,7 +567,7 @@ class Crawler:
             # entries pulled from sitemaps.
             try:
                 is_url_safe_for_public_fetch(
-                    url, allow_private=self._allow_private_networks
+                    url, allow_private=security.ALLOW_PRIVATE_NETWORKS
                 )
             except UnsafeURLError as exc:
                 logger.warning("refusing unsafe URL %s: %s", url, exc)

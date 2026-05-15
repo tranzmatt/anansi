@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import httpx
 import pytest
 import respx
@@ -67,9 +69,12 @@ async def _run_scope_crawl(tmp_path, *, allowed_domains=None, deny_patterns=None
             auto_browser=False,
             db_path=tmp_path / "crawls.db",
             adaptive_rate_limiting=False,
-            allow_private_networks=True,
         )
-        _ = [item async for item in crawler.run()]
+        # Skip the SSRF DNS check so the mocked (and possibly non-resolving)
+        # test domains exercise domain-scope logic in isolation. This mirrors
+        # an operator setting ANANSI_ALLOW_PRIVATE_NETWORKS=1.
+        with patch("anansi.security.ALLOW_PRIVATE_NETWORKS", True):
+            _ = [item async for item in crawler.run()]
 
     return fetched_urls
 
@@ -156,7 +161,8 @@ async def test_parse_yielded_request_filtered_by_scope(tmp_path) -> None:
             db_path=tmp_path / "crawls.db",
             adaptive_rate_limiting=False,
         )
-        _ = [item async for item in crawler.run()]
+        with patch("anansi.security.ALLOW_PRIVATE_NETWORKS", True):
+            _ = [item async for item in crawler.run()]
 
     assert not any("external.org" in u for u in fetched_urls), (
         f"External URL was fetched despite allowed_domains: {fetched_urls}"

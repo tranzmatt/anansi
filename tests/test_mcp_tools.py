@@ -194,7 +194,8 @@ async def test_screenshot_url_returns_base64_png() -> None:
         "data_b64": base64.b64encode(fake_png).decode(),
     }
 
-    with patch("anansi.fetchers.browser.BrowserFetcher") as MockBF:
+    with patch("anansi.fetchers.browser.BrowserFetcher") as MockBF, \
+            patch("anansi.mcp_server.server._validate_url"):
         instance = MockBF.return_value
         instance.screenshot = AsyncMock(return_value=mock_result)
         instance.close = AsyncMock()
@@ -208,25 +209,132 @@ async def test_screenshot_url_returns_base64_png() -> None:
     assert decoded[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-async def test_screenshot_url_with_path(tmp_path: Path) -> None:
+async def test_screenshot_url_with_path() -> None:
     import anansi.mcp_server.server as srv
 
-    save_path = str(tmp_path / "shot.png")
+    # A bare filename is confined under the export sandbox; the mock returns
+    # whatever path BrowserFetcher would have written.
     mock_result = {
         "url": "https://example.com",
         "format": "png",
         "width": 1280,
         "height": 800,
         "elapsed": 0.3,
-        "path": save_path,
+        "path": str(srv._EXPORT_ROOT / "shot.png"),
     }
 
-    with patch("anansi.fetchers.browser.BrowserFetcher") as MockBF:
+    with patch("anansi.fetchers.browser.BrowserFetcher") as MockBF, \
+            patch("anansi.mcp_server.server._validate_url"):
         instance = MockBF.return_value
         instance.screenshot = AsyncMock(return_value=mock_result)
         instance.close = AsyncMock()
 
-        result = await srv.screenshot_url("https://example.com", path=save_path)
+        result = await srv.screenshot_url("https://example.com", path="shot.png")
 
-    assert result.get("path") == save_path
+    assert result.get("path", "").endswith("shot.png")
     assert "data_b64" not in result
+
+
+# ── screenshot_url / train_selector security regression tests ─────────────────
+
+async def test_screenshot_url_rejects_private_ip() -> None:
+    """SSRF guard parity with fetch_url: a loopback URL is rejected and the
+    browser is never launched. Uses a literal IP so no DNS is needed."""
+    import anansi.mcp_server.server as srv
+
+    with patch("anansi.fetchers.browser.BrowserFetcher") as MockBF:
+        result = await srv.screenshot_url("http://127.0.0.1/")
+        MockBF.assert_not_called()
+
+    assert "error" in result
+    assert "unsafe url" in result["error"].lower()
+
+
+async def test_screenshot_url_rejects_path_traversal() -> None:
+    """An absolute path outside the export sandbox is rejected before any
+    file write."""
+    import anansi.mcp_server.server as srv
+
+    with patch("anansi.fetchers.browser.BrowserFetcher") as MockBF, \
+            patch("anansi.mcp_server.server._validate_url"):
+        result = await srv.screenshot_url(
+            "https://example.com", path="/etc/passwd"
+        )
+        MockBF.assert_not_called()
+
+    assert "error" in result
+    assert "rejected" in result["error"].lower()
+
+
+async def test_screenshot_url_rejects_non_css_selector() -> None:
+    """Playwright engine-prefixed selectors are rejected (CSS only)."""
+    import anansi.mcp_server.server as srv
+
+    with patch("anansi.fetchers.browser.BrowserFetcher") as MockBF, \
+            patch("anansi.mcp_server.server._validate_url"):
+        result = await srv.screenshot_url(
+            "https://example.com", selector="xpath=//div"
+        )
+        MockBF.assert_not_called()
+
+    assert "error" in result
+    assert "selector" in result["error"].lower()
+
+
+async def test_train_selector_rejects_redos_text_selector(tmp_sel_db: Path) -> None:
+    """A 'text' selector is compiled as a regex during healing, so a
+    catastrophic-backtracking pattern must be rejected at the tool boundary."""
+    import anansi.mcp_server.server as srv
+
+    result = await srv.train_selector(
+        "example.com/p/{id}", "title", "(a+)+$", selector_type="text"
+    )
+    assert "error" in result
+    assert "unsafe text selector" in result["error"].lower()
+
+
+async def test_train_selector_rejects_unknown_type() -> None:
+    import anansi.mcp_server.server as srv
+
+    result = await srv.train_selector(
+        "example.com/p/{id}", "title", ".x", selector_type="jsonpath"
+    )
+    assert "error" in result
+    assert "selector_type" in result["error"]
+
+
+async def test_fetch_url_no_allow_private_networks_kwarg() -> None:
+    """The LLM-visible flag is gone: passing it raises TypeError."""
+    import anansi.mcp_server.server as srv
+
+    with pytest.raises(TypeError):
+        await srv.fetch_url("https://example.com", allow_private_networks=True)
+
+
+def test_validate_url_respects_env_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_validate_url consults the module-level operator flag, not a kwarg."""
+    import anansi.mcp_server.server as srv
+    from anansi import security
+    from anansi.security import UnsafeURLError
+
+    # Default: loopback rejected.
+    monkeypatch.setattr(security, "ALLOW_PRIVATE_NETWORKS", False)
+    with pytest.raises(UnsafeURLError):
+        srv._validate_url("http://127.0.0.1/")
+
+    # Operator opt-in: loopback allowed.
+    monkeypatch.setattr(security, "ALLOW_PRIVATE_NETWORKS", True)
+    srv._validate_url("http://127.0.0.1/")  # must not raise
+
+
+def test_env_bool_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    from anansi.security import _env_bool
+
+    monkeypatch.setenv("ANANSI_TEST_FLAG", "1")
+    assert _env_bool("ANANSI_TEST_FLAG") is True
+    monkeypatch.setenv("ANANSI_TEST_FLAG", "TrUe")
+    assert _env_bool("ANANSI_TEST_FLAG") is True
+    monkeypatch.setenv("ANANSI_TEST_FLAG", "0")
+    assert _env_bool("ANANSI_TEST_FLAG") is False
+    monkeypatch.delenv("ANANSI_TEST_FLAG", raising=False)
+    assert _env_bool("ANANSI_TEST_FLAG") is False
