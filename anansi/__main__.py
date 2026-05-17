@@ -19,7 +19,7 @@ def main() -> None:
     fetch_p.add_argument("url")
     fetch_p.add_argument("--browser", action="store_true", help="Use headless browser")
     fetch_p.add_argument("--proxy", help="Proxy URL")
-    fetch_p.add_argument("--output", choices=["html", "text"], default="html")
+    fetch_p.add_argument("--output", choices=["html", "text", "markdown"], default="html")
 
     # mcp subcommand
     sub.add_parser("mcp", help="Start the MCP server")
@@ -60,6 +60,14 @@ async def _cmd_fetch(args: argparse.Namespace) -> None:
 
     if args.output == "html":
         console.print(Syntax(result.html[:4000], "html", theme="monokai"))
+    elif args.output == "markdown":
+        import markdownify
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(result.html, "lxml")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        md = markdownify.markdownify(str(soup), heading_style="ATX", strip=["a"]).strip()
+        console.print(md[:4000])
     else:
         from bs4 import BeautifulSoup
         text = BeautifulSoup(result.html, "lxml").get_text(separator="\n", strip=True)
