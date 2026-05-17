@@ -52,7 +52,7 @@ _EXPORT_ROOT = DATA_DIR / "exports"
 # Allowed Playwright action types. Anything outside this set is rejected before
 # the action list reaches BrowserFetcher.
 _ALLOWED_ACTION_TYPES = frozenset({
-    "click", "scroll_to_bottom", "fill", "press", "wait", "wait_for_selector",
+    "click", "scroll_to_bottom", "scroll_until_stable", "fill", "press", "wait", "wait_for_selector",
 })
 # Keys allowed in {"type": "press", ...} actions. Restricts the LLM from
 # triggering arbitrary global shortcuts (e.g. Control+S).
@@ -150,6 +150,17 @@ def _validate_actions(actions: list[dict[str, Any]] | None) -> None:
             if key not in _ALLOWED_PRESS_KEYS:
                 raise ValueError(
                     f"action #{i} press key {key!r} not in allowlist"
+                )
+        if atype == "scroll_until_stable":
+            max_scrolls = action.get("max_scrolls", 10)
+            scroll_delay = action.get("scroll_delay", 1500)
+            if not isinstance(max_scrolls, int) or not (1 <= max_scrolls <= 30):
+                raise ValueError(
+                    f"action #{i} max_scrolls must be an integer between 1 and 30"
+                )
+            if not isinstance(scroll_delay, int) or not (100 <= scroll_delay <= 5000):
+                raise ValueError(
+                    f"action #{i} scroll_delay must be an integer between 100 and 5000 ms"
                 )
         # Validate selector strings (CSS only, no Playwright engine prefixes).
         if atype in ("click", "fill", "wait_for_selector", "press"):
@@ -310,6 +321,8 @@ async def _fetch_one(
     chunk_index: int = 0,
     actions: list[dict[str, Any]] | None = None,
     impersonate: str | None = None,
+    capture_network: bool = False,
+    capture_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
     """Fetch one URL, apply format conversion + chunking, and cache the result."""
     global _page_cache_bytes
@@ -324,8 +337,8 @@ async def _fetch_one(
     cache_key = (url, format)
     now = _time.monotonic()
 
-    # Actions bypass cache since they affect dynamic page state
-    cached = None if actions else _page_cache.get(cache_key)
+    # Actions and network capture bypass cache since they affect dynamic state.
+    cached = None if (actions or capture_network) else _page_cache.get(cache_key)
     if cached and now < cached[2]:
         _page_cache.move_to_end(cache_key)
         chunks, meta = cached[0], cached[1]
@@ -339,6 +352,8 @@ async def _fetch_one(
                     wait_for=wait_for_selector,
                     timeout=timeout,
                     actions=actions,
+                    capture_network=capture_network,
+                    capture_patterns=capture_patterns,
                 )
         else:
             from anansi.fetchers.http import HTTPFetcher
@@ -381,6 +396,8 @@ async def _fetch_one(
             "elapsed": round(result.elapsed, 3),
             "via_browser": result.via_browser,
         }
+        if result.captured_requests:
+            meta["captured_requests"] = result.captured_requests
 
         if chunk_size:
             chunks = _get_chunks(result.html, format, chunk_size)
@@ -441,6 +458,8 @@ async def fetch_url(
     chunk_index: int = 0,
     actions: list[dict[str, Any]] | None = None,
     impersonate: str | None = None,
+    capture_network: bool = False,
+    capture_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Fetch a single URL and return its content.
@@ -465,6 +484,7 @@ async def fetch_url(
                  Each action is a dict with a "type" key. Supported types:
                  - {"type": "click", "selector": "button.load-more"}
                  - {"type": "scroll_to_bottom"}
+                 - {"type": "scroll_until_stable", "max_scrolls": 10, "scroll_delay": 1500}
                  - {"type": "fill", "selector": "#query", "value": "search term"}
                  - {"type": "press", "selector": "#query", "key": "Enter"}
                  - {"type": "wait", "ms": 1500}
@@ -475,15 +495,30 @@ async def fetch_url(
                      (Akamai/Cloudflare/DataDome). Must be an allowlisted
                      target; ignored if the operator set ANANSI_DISABLE_ANTIBOT.
                      Defaults to the operator's ANANSI_IMPERSONATE if unset.
+        capture_network: Browser-only. When True, intercept JSON API responses the
+                         page makes during load and actions. Useful for API-first SPAs
+                         (React/Next.js/Vue) where HTML contains little data. Results
+                         appear as captured_requests in the response. Bypasses cache.
+        capture_patterns: Optional list of URL substrings to filter captured responses.
+                          Only responses whose URL contains at least one pattern are kept.
+                          Example: ["/api/", "/graphql"]. Max 20 patterns, 200 chars each.
 
     Returns:
         {url, status, content, format, content_length, chunk_index, total_chunks,
-         elapsed, via_browser}
+         elapsed, via_browser} and optionally captured_requests when capture_network=True.
     """
     if format not in ("html", "text", "markdown"):
         return {"error": f"Invalid format {format!r}. Must be 'html', 'text', or 'markdown'."}
     if actions and len(actions) > _MAX_ACTIONS:
         return {"error": f"actions list length {len(actions)} exceeds cap {_MAX_ACTIONS}"}
+    if capture_network and not use_browser:
+        return {"error": "capture_network requires use_browser=true"}
+    if capture_patterns is not None:
+        if len(capture_patterns) > 20:
+            return {"error": "capture_patterns list exceeds maximum of 20 entries"}
+        for p in capture_patterns:
+            if not isinstance(p, str) or not p or len(p) > 200:
+                return {"error": "each capture_pattern must be a non-empty string of at most 200 chars"}
     try:
         proxy = _validate_proxy(proxy)
     except UnsafeURLError as exc:
@@ -508,6 +543,8 @@ async def fetch_url(
         chunk_index=chunk_index,
         actions=actions,
         impersonate=impersonate,
+        capture_network=capture_network,
+        capture_patterns=capture_patterns,
     )
 
 

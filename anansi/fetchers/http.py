@@ -19,7 +19,7 @@ from tenacity import (
 
 from anansi import security
 from anansi.fetchers.base import BaseFetcher, FetchResult
-from anansi.security import is_url_safe_for_public_fetch
+from anansi.security import InvalidImpersonateError, is_url_safe_for_public_fetch, validate_impersonate
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_RESPONSE_BYTES = 50 * 1024 * 1024  # 50 MB
 # Cap on redirect chain length. httpx default is 20; we tighten it.
 _MAX_REDIRECTS = 5
+# Sentinel: distinguish "caller did not pass impersonate" from "caller explicitly passed None".
+_UNSET: object = object()
 
 
 class ResponseTooLargeError(Exception):
@@ -146,6 +148,7 @@ class HTTPFetcher(BaseFetcher):
         proxy: str | None = None,
         timeout: float | None = None,
         referer: str | None = None,
+        impersonate: "str | None | object" = _UNSET,
         **kwargs: Any,
     ) -> FetchResult:
         if self._rotate_ua:
@@ -162,10 +165,25 @@ class HTTPFetcher(BaseFetcher):
 
         merged_headers = _build_headers(self._ua, extra)
 
-        if self._impersonate:
+        # Resolve effective TLS impersonation target. Per-request value wins
+        # over the instance-level default; explicit None forces plain httpx
+        # even if an instance default is set. Caller-supplied values are
+        # validated against the allowlist before use.
+        if impersonate is _UNSET:
+            effective_impersonate = self._impersonate
+        else:
+            if impersonate is not None:
+                try:
+                    impersonate = validate_impersonate(str(impersonate))
+                except InvalidImpersonateError:
+                    raise
+            effective_impersonate = impersonate  # type: ignore[assignment]
+
+        if effective_impersonate and not security.DISABLE_ANTIBOT:
             return await self._fetch_curl_cffi(
                 url, method=method, headers=merged_headers,
                 body=body, proxy=proxy, timeout=timeout or self._timeout,
+                impersonate=effective_impersonate,
             )
         return await self._fetch_httpx(
             url, method=method, headers=merged_headers,
@@ -219,18 +237,18 @@ class HTTPFetcher(BaseFetcher):
         body: bytes | None,
         proxy: str | None,
         timeout: float,
+        impersonate: str,
     ) -> FetchResult:
         """Fetch using curl-cffi to mimic a real browser TLS fingerprint."""
-        # Operator kill-switch: when anti-bot evasion is disabled, do not
-        # perform TLS-fingerprint impersonation. Warn and fall back to plain
-        # httpx so existing callers keep working (per confirmed decision).
+        # Safety backstop: DISABLE_ANTIBOT should have been checked by fetch()
+        # before routing here, but guard again so this method stays safe if
+        # called directly (e.g. in tests).
         if security.DISABLE_ANTIBOT:
             logger.warning(
                 "ANANSI_DISABLE_ANTIBOT set — ignoring impersonate=%r and "
                 "falling back to plain httpx",
-                self._impersonate,
+                impersonate,
             )
-            self._impersonate = None
             return await self._fetch_httpx(
                 url, method=method, headers=headers,
                 body=body, proxy=proxy, timeout=timeout,
@@ -268,7 +286,7 @@ class HTTPFetcher(BaseFetcher):
                 # the shared SSRF-checked redirect loop (parity with the httpx
                 # path; impersonate must not weaken the SSRF guard).
                 async with AsyncSession(
-                    impersonate=self._impersonate,
+                    impersonate=impersonate,
                     allow_redirects=False,
                 ) as session:
                     cur_url, cur_method, cur_body = url, method, body

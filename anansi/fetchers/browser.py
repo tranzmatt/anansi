@@ -12,6 +12,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import random
@@ -124,6 +125,48 @@ _STEALTH_JS = """
     const root = origAttach.apply(this, args);
     return root;
   };
+
+  // 11. Audio context fingerprint noise — adds imperceptible perturbation to
+  //     audio sample data, defeating hash-based AudioBuffer fingerprinting.
+  try {
+    const _origGetChannelData = AudioBuffer.prototype.getChannelData;
+    AudioBuffer.prototype.getChannelData = function(channel) {
+      const data = _origGetChannelData.call(this, channel);
+      for (let i = 0; i < data.length; i += 100) {
+        data[i] += Math.random() * 1e-7 - 5e-8;
+      }
+      return data;
+    };
+  } catch(_) {}
+
+  // 12. Font measurement noise — canvas font fingerprinting measures glyph
+  //     widths; tiny variation per session defeats exact-match clustering.
+  try {
+    const _origMeasureText = CanvasRenderingContext2D.prototype.measureText;
+    CanvasRenderingContext2D.prototype.measureText = function(text) {
+      const m = _origMeasureText.call(this, text);
+      try {
+        Object.defineProperty(m, 'width', {
+          value: m.width + (Math.random() - 0.5) * 0.05,
+        });
+      } catch(_) {}
+      return m;
+    };
+  } catch(_) {}
+
+  // 13. Battery API — navigator.getBattery() is commonly fingerprinted;
+  //     return a plausible plugged-in desktop value.
+  try {
+    navigator.getBattery = () => Promise.resolve({
+      charging: true, chargingTime: 0, dischargingTime: Infinity, level: 0.95,
+      addEventListener: () => {}, removeEventListener: () => {},
+    });
+  } catch(_) {}
+
+  // 14. Touch points — real desktops report 0; Playwright headless may not.
+  try {
+    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+  } catch(_) {}
 })();
 """
 
@@ -170,6 +213,54 @@ _VIEWPORTS = [
 
 _HW_CONCURRENCY_OPTIONS = [4, 8, 12, 16]
 _DEVICE_MEMORY_OPTIONS = [4, 8, 16]
+
+# GDPR/CCPA consent platform selectors, ordered most-specific → most-generic.
+# Only used by _dismiss_cookie_consent(); never exposed to untrusted callers.
+_CONSENT_SELECTORS = [
+    "#onetrust-accept-btn-handler",                              # OneTrust
+    "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",    # Cookiebot
+    ".qc-cmp2-summary-buttons button:last-child",                # Quantcast
+    ".truste_cm_btn",                                            # TrustArc
+    "#truste-consent-button",                                    # TrustArc alt
+    "#didomi-notice-agree-button",                               # Didomi
+    ".cc-btn.cc-allow",                                          # Cookie Consent by Insites
+    "#cookie-consent-accept",
+    # Generic heuristics (broader — tried last to minimise false positives)
+    "button[id*='accept-all']",
+    "button[id*='cookie-accept']",
+    "button[id*='consent-accept']",
+    "button[class*='cookie-accept']",
+    "button[class*='consent-accept']",
+    "[aria-label*='Accept all']",
+    "[aria-label*='accept cookies']",
+    "button:has-text('Accept all')",
+    "button:has-text('Accept All')",
+    "button:has-text('Allow all')",
+    "button:has-text('I agree')",
+    "button:has-text('Accept cookies')",
+]
+
+
+async def _dismiss_cookie_consent(page: Any) -> bool:
+    """Attempt to click a GDPR/cookie consent accept button.
+
+    Tries each selector in _CONSENT_SELECTORS with a short timeout. Returns
+    True if a banner was dismissed, False if none was found. Never raises —
+    a missing banner is not an error. Skips entirely when DISABLE_ANTIBOT is
+    set so tests and debugging environments stay predictable.
+    """
+    from anansi import security
+    if security.DISABLE_ANTIBOT:
+        return False
+    for sel in _CONSENT_SELECTORS:
+        try:
+            await page.locator(sel).first.click(timeout=1500)
+            await asyncio.sleep(0.3)
+            return True
+        except Exception:
+            continue
+    return False
+
 
 # WebRTC leak mitigation — hides real IP even when behind a proxy
 _WEBRTC_BLOCK_JS = """
@@ -410,6 +501,25 @@ class BrowserFetcher(BaseFetcher):
                     await page.click(sel)
                 elif atype == "scroll_to_bottom":
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                elif atype == "scroll_until_stable":
+                    max_scrolls = min(int(action.get("max_scrolls", 10)), 30)
+                    scroll_delay = min(int(action.get("scroll_delay", 1500)), 5000)
+                    prev_height: int = await page.evaluate("document.body.scrollHeight")
+                    stable_count = 0
+                    for _ in range(max_scrolls):
+                        if spent_ms + scroll_delay > _MAX_BUDGET_MS:
+                            break
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(scroll_delay / 1000)
+                        spent_ms += scroll_delay
+                        new_height: int = await page.evaluate("document.body.scrollHeight")
+                        if new_height == prev_height:
+                            stable_count += 1
+                            if stable_count >= 2:
+                                break
+                        else:
+                            stable_count = 0
+                            prev_height = new_height
                 elif atype == "fill":
                     sel = validate_browser_selector(action["selector"])
                     await page.fill(sel, action["value"])
@@ -454,6 +564,9 @@ class BrowserFetcher(BaseFetcher):
         wait_for: str | None = None,
         wait_until: str = "domcontentloaded",
         actions: list[dict[str, Any]] | None = None,
+        auto_consent: bool = True,
+        capture_network: bool = False,
+        capture_patterns: list[str] | None = None,
         **kwargs: Any,
     ) -> FetchResult:
         t0 = time.perf_counter()
@@ -464,6 +577,26 @@ class BrowserFetcher(BaseFetcher):
             try:
                 if headers:
                     await page.set_extra_http_headers(headers)
+
+                # Collect JSON API responses the page makes during navigation.
+                # The listener is registered before goto() so responses from
+                # the initial document load are captured.
+                _captured_resp_objects: list[Any] = []
+                if capture_network:
+                    async def _on_response(resp: Any) -> None:
+                        try:
+                            ct = resp.headers.get("content-type", "")
+                            if "json" not in ct:
+                                return
+                            if capture_patterns and not any(
+                                p in resp.url for p in capture_patterns
+                            ):
+                                return
+                            if len(_captured_resp_objects) < 50:
+                                _captured_resp_objects.append(resp)
+                        except Exception:
+                            pass
+                    page.on("response", _on_response)
 
                 await self._simulate_human(page)
 
@@ -480,6 +613,9 @@ class BrowserFetcher(BaseFetcher):
                 if self._is_cloudflare_challenge(content):
                     await self._wait_for_cloudflare(page)
                     content = await page.content()
+
+                if auto_consent:
+                    await _dismiss_cookie_consent(page)
 
                 if wait_for:
                     from anansi.security import validate_browser_selector
@@ -498,6 +634,21 @@ class BrowserFetcher(BaseFetcher):
                     for c in await ctx.cookies()
                 }
 
+                # Read captured response bodies after all navigation is done.
+                captured_requests: list[dict[str, Any]] = []
+                for captured_resp in _captured_resp_objects:
+                    try:
+                        body_bytes = await captured_resp.body()
+                        if len(body_bytes) > 200 * 1024:
+                            continue
+                        captured_requests.append({
+                            "url": captured_resp.url,
+                            "status": captured_resp.status,
+                            "body": json.loads(body_bytes),
+                        })
+                    except Exception:
+                        pass
+
                 return FetchResult(
                     url=page.url,
                     status=status,
@@ -506,6 +657,7 @@ class BrowserFetcher(BaseFetcher):
                     cookies=cookies,
                     elapsed=time.perf_counter() - t0,
                     via_browser=True,
+                    captured_requests=captured_requests,
                 )
             finally:
                 await page.close()

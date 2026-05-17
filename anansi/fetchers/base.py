@@ -17,6 +17,7 @@ class FetchResult:
     elapsed: float = 0.0
     via_browser: bool = False
     spa_state: dict[str, Any] | None = None
+    captured_requests: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
