@@ -27,7 +27,7 @@ The result: a crawler that handles hostile sites, survives redesigns, and gets b
 | **Item validation** | Set `item_schema = MyPydanticModel` on a Spider and every yielded item is validated before persistence. Type coercion is automatic (`"49.99"` → `49.99`). Invalid items carry a `_validation_errors` key; valid/invalid counts and error rate appear in live crawl metrics. |
 | **Concurrent crawler** | Pure asyncio, semaphore-gated workers, SQLite-backed URL queue. Crawls survive process restarts. Pause mid-run and resume days later with `Crawler.resume(crawl_id, MySpider)`. |
 | **Proxy rotation** | HTTP/HTTPS/SOCKS5 with round-robin, random, or least-used strategies. Failed proxies are auto-quarantined and retested in the background. |
-| **MCP server** | FastMCP server exposes 12 scraping tools — fetch, extract, crawl, pause, resume, export, metrics — so any LLM or tool-calling agent can drive a full crawl through a conversation. |
+| **MCP server** | FastMCP server exposes 17 scraping tools — fetch, extract, crawl, screenshot, train/validate selectors, cancel, cache control, and more — so any LLM or tool-calling agent can drive a full crawl through a conversation. |
 
 Also includes: JS interaction (click, fill, scroll, wait), robots.txt compliance, sitemap discovery, content deduplication, auth/cookie support, configurable retries with `Retry-After` support, CSV/JSON/JSONL export.
 
@@ -283,6 +283,11 @@ python -m anansi.mcp_server.server
 | `resume_crawl` | Resume a paused crawl (same process) |
 | `list_crawls` | List all crawls and their state |
 | `selector_health` | Inspect learned selector confidence scores for a URL pattern |
+| `cancel_crawl` | Permanently cancel a running or paused crawl (irreversible; distinct from `pause_crawl`) |
+| `screenshot_url` | Capture a PNG screenshot of any page via headless browser; returns base64 or saves to file |
+| `train_selector` | Manually teach the parser a correct CSS/XPath/text selector for a URL pattern at confidence 1.0 |
+| `validate_selector` | Test CSS selectors against a live page without affecting stored confidence scores |
+| `clear_cache` | Invalidate the in-memory page cache (all entries, or a single URL) |
 
 ### `fetch_url` parameters
 
