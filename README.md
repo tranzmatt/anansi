@@ -20,7 +20,7 @@ The result: a crawler that handles hostile sites, survives redesigns, and gets b
 | **Structured data extraction** | JSON-LD, Open Graph, and Microdata are extracted from every page automatically. Fields matched in schema.org markup skip CSS evaluation entirely — they're more stable and require no selector maintenance. |
 | **TLS / HTTP-2 fingerprint mimicry** | Enterprise bot-detection (Cloudflare, Akamai, DataDome) fingerprints your TLS ClientHello *and* HTTP/2 SETTINGS/frame ordering before inspecting a single header. With `impersonate="chrome124"`, Anansi uses curl-cffi to reproduce both, plus per-host session warm-up and a graduated Akamai-block escalation ladder. Install the `tls` extra (see [Install](#install)); operator-gated, authorized use only. |
 | **Auto browser upgrade** | Every HTTP response is checked for SPA markers, noscript redirects, and suspiciously low text density. JS shells trigger a silent retry with a stealth Playwright browser. The decision is cached per domain for the crawl session. |
-| **Anti-bot & Cloudflare bypass** | The browser fetcher removes `webdriver` fingerprints, spoofs plugins and hardware concurrency, adds canvas/WebGL noise, and waits out Cloudflare Turnstile challenges automatically. |
+| **Anti-bot & Cloudflare bypass** | The browser fetcher removes `webdriver` fingerprints, spoofs plugins, hardware concurrency, audio context, font measurements, battery API, and touch points, adds canvas/WebGL noise, auto-dismisses GDPR/cookie consent banners, and waits out Cloudflare Turnstile challenges automatically. |
 | **Adaptive rate limiting** | A per-domain sliding window tracks error rates. A 429 immediately doubles the request gap and activates a circuit breaker. Sustained 5xx errors increase the gap further. Clean windows slowly decay back toward the base delay. |
 | **Incremental crawling** | ETag, Last-Modified, and content MD5 are stored per URL. Re-crawls send conditional GET headers — 304 responses skip parsing entirely, and hash comparison catches changes even without server-side ETag support. Sitemap `<lastmod>` dates are used for a pre-flight filter that skips unchanged pages before a network request is even made. |
 | **URL canonicalization** | Tracking parameters (`utm_*`, `fbclid`, `gclid`, and 25 others) are stripped before URLs enter the queue. Remaining parameters are sorted and fragments removed — so `?utm_source=twitter` and `?utm_source=facebook` are the same crawl target. |
@@ -29,7 +29,7 @@ The result: a crawler that handles hostile sites, survives redesigns, and gets b
 | **Proxy rotation** | HTTP/HTTPS/SOCKS5 with round-robin, random, or least-used strategies. Failed proxies are auto-quarantined and retested in the background. |
 | **MCP server** | FastMCP server exposes 17 scraping tools — fetch, extract, crawl, screenshot, train/validate selectors, cancel, cache control, and more — so any LLM or tool-calling agent can drive a full crawl through a conversation. |
 
-Also includes: JS interaction (click, fill, scroll, wait), robots.txt compliance, sitemap discovery, content deduplication, auth/cookie support, configurable retries with `Retry-After` support, CSV/JSON/JSONL export.
+Also includes: JS interaction (click, fill, scroll, infinite-scroll loop, wait), network request interception (capture JSON API responses from SPAs), robots.txt compliance, sitemap discovery, content deduplication, auth/cookie support, configurable retries with `Retry-After` support, CSV/JSON/JSONL export.
 
 ---
 
@@ -229,6 +229,13 @@ from anansi.fetchers.http import HTTPFetcher
 async with HTTPFetcher(impersonate="chrome124") as f:
     result = await f.fetch("https://bot-protected-site.com")
     print(result.html)
+
+# Per-request profile rotation — vary the TLS fingerprint across requests
+# to avoid a fixed JA3/JA4 hash being flagged across sessions.
+async with HTTPFetcher(impersonate="chrome124") as f:
+    r1 = await f.fetch("https://example.com/page1", impersonate="chrome131")
+    r2 = await f.fetch("https://example.com/page2", impersonate="safari18_0")
+    r3 = await f.fetch("https://example.com/page3", impersonate=None)   # plain httpx
 ```
 
 Without `[tls]` installed, Anansi logs a warning and falls back to standard httpx automatically — no code change required.
@@ -302,6 +309,9 @@ python -m anansi.mcp_server.server
 | `chunk_size` | `null` | Max characters per chunk — `null` returns the full page |
 | `chunk_index` | `0` | Which chunk to return (0-indexed) |
 | `actions` | `null` | Browser interactions to run after page load (see below) |
+| `impersonate` | `null` | curl-cffi TLS/HTTP-2 fingerprint target (e.g. `"chrome124"`); falls back to `ANANSI_IMPERSONATE` env var; per-request, overrides the instance default |
+| `capture_network` | `false` | **Browser only.** Intercept JSON API responses the page makes during load/actions. Returns raw payloads in `captured_requests` — ideal for API-first SPAs. Bypasses cache. |
+| `capture_patterns` | `null` | URL substrings to filter captured responses (e.g. `["/api/", "/graphql"]`). Max 20 entries. Requires `capture_network=true`. |
 
 ### Handling large pages
 
@@ -346,22 +356,20 @@ Fields matched in JSON-LD or Open Graph appear in `data` directly — CSS select
 
 Pass an `actions` list with `use_browser=true` for dynamically loaded content. Actions execute in order after page load.
 
-| Type | Required fields | Description |
-|---|---|---|
-| `click` | `selector` | Click a CSS-matched element |
-| `fill` | `selector`, `value` | Type text into an input |
-| `press` | `selector`, `key` | Press a key while an element is focused |
-| `scroll_to_bottom` | — | Scroll to the bottom of the page |
-| `wait` | `ms` | Pause for N milliseconds |
-| `wait_for_selector` | `selector` | Wait until a CSS selector appears in the DOM |
+| Type | Required fields | Optional fields | Description |
+|---|---|---|---|
+| `click` | `selector` | — | Click a CSS-matched element |
+| `fill` | `selector`, `value` | — | Type text into an input |
+| `press` | `selector`, `key` | — | Press a key while an element is focused |
+| `scroll_to_bottom` | — | — | Scroll to the bottom of the page (single shot) |
+| `scroll_until_stable` | — | `max_scrolls` (1–30, default 10), `scroll_delay` (100–5000 ms, default 1500) | Scroll repeatedly until page height stops changing — handles infinite-scroll feeds, product listings, and lazy-loaded content. Stops when height is stable for 2 consecutive checks, or when the 60 s action budget is hit. |
+| `wait` | `ms` | — | Pause for N milliseconds |
+| `wait_for_selector` | `selector` | — | Wait until a CSS selector appears in the DOM |
 
 ```
-# Infinite scroll
+# Infinite scroll — load all items automatically
 fetch_url(url="https://example.com/feed", use_browser=true, actions=[
-    {"type": "scroll_to_bottom"},
-    {"type": "wait", "ms": 2000},
-    {"type": "scroll_to_bottom"},
-    {"type": "wait", "ms": 1500},
+    {"type": "scroll_until_stable", "max_scrolls": 15, "scroll_delay": 1500},
 ])
 
 # Submit a search form
@@ -371,6 +379,33 @@ fetch_url(url="https://example.com/search", use_browser=true, format="text", act
     {"type": "wait_for_selector", "selector": ".results"},
 ])
 ```
+
+### Network request interception (`capture_network`)
+
+Many modern sites (React, Next.js, Vue, Nuxt) render a minimal HTML shell and load all actual data via XHR/fetch API calls. `capture_network=true` registers a response listener _before_ navigation and collects every JSON API response the page makes — bypassing HTML parsing entirely.
+
+```
+fetch_url(
+    url="https://shop.example.com/products",
+    use_browser=true,
+    capture_network=true,
+    capture_patterns=["/api/products", "/graphql"],
+    actions=[{"type": "scroll_until_stable"}],
+)
+# → {
+#     "url": "https://...", "status": 200, "via_browser": true,
+#     "captured_requests": [
+#       {"url": "https://shop.example.com/api/products?page=1", "status": 200,
+#        "body": {"items": [...], "total": 240}},
+#       ...
+#     ],
+#     "content": "...",   # HTML shell (often minimal)
+#   }
+```
+
+- Capped at 50 responses, 200 KB each (larger responses are silently skipped)
+- `capture_patterns` filters by URL substring; omit to capture all JSON responses
+- Results bypass the page cache (each call re-fetches and re-intercepts)
 
 ### Client configuration
 
